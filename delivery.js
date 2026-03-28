@@ -275,7 +275,7 @@ const DeliverySystem = {
         this.renderCalendar();
         this.validateDate();
         // Show time slots for pickup mode
-        if (this.selectedMode === 'pickup' && this.selectedDate) {
+        if ((this.selectedMode === 'pickup' || this.selectedMode === 'local') && this.selectedDate) {
             this.renderTimeSlots(dateStr);
         } else {
             this.hideTimeSlots();
@@ -352,7 +352,7 @@ const DeliverySystem = {
         const dayName = date.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
 
         container.innerHTML = `
-            <label><i class="fas fa-clock"></i> Créneau de retrait — ${dayName}</label>
+            <label><i class="fas fa-clock"></i> Créneau ${this.selectedMode === 'pickup' ? 'de retrait' : 'de livraison'} — ${dayName}</label>
             <div class="time-slots-grid">
                 ${slots.map(slot => `
                     <button type="button" class="time-slot-btn${this.selectedTimeSlot === slot.value ? ' selected' : ''}" 
@@ -848,13 +848,17 @@ const DeliverySystem = {
             if (data.features && data.features.length > 0) {
                 suggestionsDiv.innerHTML = data.features.map((feature, index) => {
                     const props = feature.properties;
-                    const address = `${props.name || ''} ${props.postcode || ''} ${props.city || ''}`;
+                    const coords = feature.geometry?.coordinates || [];
+                    const lng = coords[0] || '';
+                    const lat = coords[1] || '';
                     return `
                         <div style="padding: 0.75rem; border-bottom: 1px solid #F0F0F0; cursor: pointer; font-size: 0.9rem; color: #333;" 
                              data-index="${index}" 
                              data-street="${props.name || ''}" 
                              data-zip="${props.postcode || ''}" 
                              data-city="${props.city || ''}"
+                             data-lat="${lat}"
+                             data-lng="${lng}"
                              data-target="${suggestionsDivId === 'localAddressSuggestions' ? 'local' : 'gls'}"
                              onmouseover="this.style.backgroundColor='#F5F5F5'"
                              onmouseout="this.style.backgroundColor='transparent'">
@@ -869,12 +873,14 @@ const DeliverySystem = {
                 // Add click listeners to suggestions
                 suggestionsDiv.querySelectorAll('div[data-index]').forEach(item => {
                     item.addEventListener('mousedown', (e) => {
-                        e.preventDefault(); // Prevent blur from hiding before click
+                        e.preventDefault();
                         this.selectAddressFromSuggestion(
                             item.dataset.street,
                             item.dataset.zip,
                             item.dataset.city,
-                            item.dataset.target
+                            item.dataset.target,
+                            item.dataset.lat,
+                            item.dataset.lng
                         );
                     });
                 });
@@ -887,17 +893,15 @@ const DeliverySystem = {
         }
     },
 
-    selectAddressFromSuggestion(street, zip, city, target = 'gls') {
+    selectAddressFromSuggestion(street, zip, city, target = 'gls', lat = '', lng = '') {
         let streetField, zipField, cityField, suggestionsDiv;
         
         if (target === 'local') {
-            // Local delivery fields
             streetField = document.getElementById('deliveryAddressInput');
             zipField = document.getElementById('deliveryAddressZip');
             cityField = document.getElementById('deliveryAddressCity');
             suggestionsDiv = document.getElementById('localAddressSuggestions');
         } else {
-            // GLS fields
             streetField = document.getElementById('glsAddressStreet');
             zipField = document.getElementById('glsAddressZip');
             cityField = document.getElementById('glsAddressCity');
@@ -912,7 +916,12 @@ const DeliverySystem = {
         // Trigger validation/distance calculation
         this.deliveryAddress = `${street}, ${zip} ${city}`;
         if (this.selectedMode === 'local' || target === 'local') {
-            this.calculateDistance(this.deliveryAddress);
+            // Use coordinates from data.gouv.fr directly if available
+            if (lat && lng) {
+                this.calculateDistanceFromCoords(parseFloat(lat), parseFloat(lng));
+            } else {
+                this.calculateDistance(this.deliveryAddress);
+            }
         }
     },
 
@@ -1147,8 +1156,29 @@ const DeliverySystem = {
     },
 
     // ===================================
-    // Haversine Distance (km)
+    // Calculate Distance from coordinates (skip Nominatim)
     // ===================================
+    calculateDistanceFromCoords(lat, lng) {
+        const result = document.getElementById('distanceResult');
+        const loader = document.getElementById('addressLoader');
+        if (loader) loader.classList.remove('active');
+
+        const distance = this.haversineDistance(this.config.shopLat, this.config.shopLng, lat, lng);
+        const roadDistance = Math.round(distance * 1.3);
+        this.deliveryDistance = roadDistance;
+
+        if (roadDistance <= this.config.maxLocalDistance) {
+            let priceInfo = this.getLocalPrice(roadDistance);
+            result.className = 'distance-result visible success';
+            result.innerHTML = `<i class="fas fa-check-circle"></i> ~${roadDistance} km — Frais de livraison : <strong>${priceInfo.label}</strong>`;
+        } else {
+            result.className = 'distance-result visible error';
+            result.innerHTML = `<i class="fas fa-exclamation-triangle"></i> ~${roadDistance} km — Adresse trop éloignée pour la livraison locale. Choisissez la livraison France (GLS).`;
+            this.deliveryDistance = null;
+        }
+
+        this.updatePricing();
+    },
     haversineDistance(lat1, lon1, lat2, lon2) {
         const R = 6371;
         const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -1282,9 +1312,9 @@ const DeliverySystem = {
             ? (this.deliveryDistance !== null && this.validateFrenchAddress())
             : glsAddressProvided;
         // For France GLS, date is not required
-        // For pickup, both date AND time slot are required
+        // For pickup and local, both date AND time slot are required
         const hasTimeSlot = this.selectedTimeSlot !== null;
-        const dateOk = this.selectedMode === 'france' || (this.selectedMode === 'pickup' ? (hasDate && hasTimeSlot) : hasDate);
+        const dateOk = this.selectedMode === 'france' || ((this.selectedMode === 'pickup' || this.selectedMode === 'local') ? (hasDate && hasTimeSlot) : hasDate);
 
         const canConfirm = hasMode && hasPrice && dateOk && hasAddress;
         
@@ -1326,7 +1356,7 @@ const DeliverySystem = {
                 if (dateRow) dateRow.style.display = '';
                 const d = new Date(this.selectedDate);
                 let dateText = d.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
-                if (this.selectedMode === 'pickup' && this.selectedTimeSlot) {
+                if ((this.selectedMode === 'pickup' || this.selectedMode === 'local') && this.selectedTimeSlot) {
                     dateText += ` à ${this.selectedTimeSlot}`;
                 }
                 dateEl.textContent = dateText;
@@ -1491,7 +1521,7 @@ const DeliverySystem = {
 
         const note = `Mode: ${modeLabels[this.selectedMode]}` +
             (deliveryInfo.dateFormatted ? ` | Date souhaitée: ${deliveryInfo.dateFormatted}` : '') +
-            (this.selectedTimeSlot ? ` | Créneau retrait: ${this.selectedTimeSlot}` : '') +
+            (this.selectedTimeSlot ? ` | Créneau ${this.selectedMode === 'pickup' ? 'retrait' : 'livraison'}: ${this.selectedTimeSlot}` : '') +
             (this.deliveryAddress ? ` | Adresse: ${this.deliveryAddress}` : '') +
             ` | Frais livraison: ${this.deliveryPrice === 0 ? 'Gratuit' : this.formatPrice(this.deliveryPrice)}`;
 
